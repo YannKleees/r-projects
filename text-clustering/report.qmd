@@ -1,0 +1,386 @@
+---
+title: "Text clustering"
+author:
+  - Thijs Letter
+  - Gerasimos Karatosidis
+  - Pieter Wassink
+  - Yann Klees
+date: last-modified
+format:
+  html:
+    toc: true
+    self-contained: true
+    code-fold: true
+    df-print: kable
+---
+
+```{r}
+#| label: packages
+#| echo: false
+#| warning: false
+#| message: false
+
+# packages needed to render this report:
+# text2vec, wordcloud, magrittr, flexclust, mclust, tidyverse, tm, Matrix,
+# cluster, topicmodels, slam, fpc, word2vec, lgr
+
+library(text2vec)
+library(wordcloud)
+library(magrittr)
+library(flexclust)
+library(mclust)
+library(tidyverse)  # loaded last, so mclust does not mask count() and map()
+
+# hide the progress messages of text2vec
+lgr::get_logger("rsparse")$set_threshold("warn")
+lgr::get_logger("text2vec")$set_threshold("warn")
+```
+
+```{r}
+#| label: data_loading
+
+data("movie_review")
+
+# check for missing values and duplicate reviews
+c(missing = sum(is.na(movie_review)), duplicates = sum(duplicated(movie_review)))
+```
+
+# Data description
+
+```{r}
+#| label: eda_top_words
+#| warning: false
+
+# words that count as noise: stopwords and the HTML line break
+stops <- c(tm::stopwords("en"), "br")
+
+# 20 most frequent raw words, marked as noise or content
+top_words <-
+  tibble(word = unlist(str_split(str_to_lower(movie_review$review), "[^a-z']+"))) |>
+  filter(word != "") |>
+  count(word, sort = TRUE) |>
+  slice_head(n = 20) |>
+  mutate(type = if_else(word %in% stops, "Stopword or HTML", "Content word"))
+
+top_words |>
+  ggplot(aes(x = n, y = fct_reorder(word, n), fill = type)) +
+  geom_col() +
+  scale_fill_manual(values = c("Stopword or HTML" = "red", "Content word" = "navy")) +
+  labs(title = "20 most frequent words", x = "Frequency", y = "", fill = "") +
+  theme_minimal()
+```
+
+```{r}
+#| label: eda_star_ratings
+#| warning: false
+
+# the number after the underscore in the id is the star rating
+movie_review |>
+  mutate(rating = as.integer(str_remove(id, ".*_"))) |>
+  ggplot(aes(x = rating)) +
+  geom_bar(fill = "navy") +
+  scale_x_continuous(breaks = 1:10) +
+  labs(title = "Star ratings", x = "Rating", y = "Number of reviews") +
+  theme_minimal()
+```
+
+The dataset contains 5000 IMDB movie reviews, each with an id, a positive or negative sentiment label and the review text. No single movie has more than 30 reviews. There are no missing values or duplicate reviews, and both sentiment classes are roughly equal in size. The star rating plot shows that ratings 5 and 6 are missing, because neutral reviews were left out when the dataset was built. The two classes are therefore clearly separated, which makes sentiment a useful label for checking our clusters afterwards.
+
+The raw text is noisy. The most frequent words are almost all stopwords such as the and and, and the HTML line break br is among them. None of these words say anything about the film or the opinion of the reviewer, which is why we clean the text before clustering.
+
+# Text pre-processing
+
+```{r}
+#| label: pre_processing
+#| warning: false
+
+# remove HTML tags and URLs, lowercase, keep only letters, drop very short words
+clean_text <-
+  movie_review$review |>
+  str_replace_all("<[^>]+>", " ") |>
+  str_replace_all("https?://\\S+|www\\.\\S+", " ") |>
+  str_to_lower() |>
+  str_replace_all("[^a-z ]", " ") |>
+  str_replace_all("\\b[a-z]{1,2}\\b", " ") |>
+  str_squish()
+
+# split into words
+it <- itoken(clean_text, tokenizer = word_tokenizer, progressbar = FALSE)
+
+# build vocabulary without stopwords
+vocab <- create_vocabulary(it, stopwords = tm::stopwords("en"))
+
+# drop rare words and words that appear in more than half of all reviews
+vocab <- prune_vocabulary(vocab, term_count_min = 10, doc_proportion_max = 0.5)
+```
+
+We first removed HTML tags such as the line break and the few URLs in the reviews, and converted all text to lowercase. We then removed punctuation, numbers and words shorter than three letters, since these carry little meaning. After splitting the reviews into words, we removed common English stopwords such as the, and and is.
+
+Finally, we removed rare words that appear fewer than ten times in total, as well as very common words that appear in more than half of all reviews. Rare words mostly add noise and make the data much larger, while very common words appear in almost every review and do not help to tell reviews apart. The same cleaned text is used for both text representations below, so differences between them come from the representation and not from the cleaning.
+
+# Text representation
+
+```{r}
+#| label: tf_idf
+#| warning: false
+
+# document term matrix with word counts
+dtm <- create_dtm(it, vocab_vectorizer(vocab))
+
+# weight the counts with TF IDF
+tfidf     <- TfIdf$new(norm = "l2")
+dtm_tfidf <- fit_transform(dtm, tfidf)
+```
+
+```{r}
+#| label: comparison_cloud
+#| warning: false
+
+# total count of each word in negative and positive reviews
+sentiment_counts <- cbind(
+  Negative = Matrix::colSums(dtm[movie_review$sentiment == 0, ]),
+  Positive = Matrix::colSums(dtm[movie_review$sentiment == 1, ])
+)
+
+comparison.cloud(sentiment_counts, max.words = 80, random.order = FALSE,
+                 colors = c("red", "navy"), title.size = 1.5)
+```
+
+Our main representation is a document term matrix, where each review is a row, each word is a column and each cell counts how often the word appears. This ignores word order but is simple and works well for grouping texts. We apply TF IDF weighting, which gives more weight to words that are frequent in one review but rare overall, and normalise each row so long and short reviews can be compared fairly. The comparison cloud shows that after cleaning, words such as bad, worst and waste are typical for negative reviews and great, best and love for positive ones.
+
+```{r}
+#| label: word2vec
+#| warning: false
+
+# CBOW word embeddings trained on the cleaned reviews
+set.seed(123)
+w2v <- word2vec::word2vec(clean_text, type = "cbow", dim = 20, iter = 30, threads = 1)
+emb <- as.matrix(w2v)
+
+# each review is the count weighted average of its word vectors
+common  <- intersect(colnames(dtm), rownames(emb))
+dtm_w2v <- dtm[, common]
+doc_w2v <- as.matrix(dtm_w2v %*% emb[common, ]) / pmax(Matrix::rowSums(dtm_w2v), 1)
+doc_w2v <- doc_w2v / sqrt(rowSums(doc_w2v^2))
+
+# nearest words as a sanity check of the embeddings
+predict(w2v, c("great", "boring", "horror"), type = "nearest", top_n = 5) |>
+  map(\(x) str_c(x$term2, collapse = ", ")) |>
+  enframe(name = "word", value = "nearest") |>
+  unnest(nearest)
+```
+
+As a second representation, we train a word2vec CBOW model on the cleaned reviews. It learns a 20 dimensional vector for each word from the words around it, so words used in similar contexts, such as great and excellent, get similar vectors, while TF IDF treats them as unrelated columns. The nearest words in the table confirm that the embeddings capture meaning. Each review is represented by the average of its word vectors, using the same vocabulary as the document term matrix, and normalised to length one. This turns every review into a short dense vector instead of a long sparse one.
+
+# Text clustering
+
+We compare four clustering methods on the TF IDF representation, each with 5 and 10 clusters: K means, K medians, a Gaussian mixture model and LDA topic modeling. We also run K means and K medians on the word2vec representation, to test whether the choice of representation matters more than the choice of method. Each method makes a different assumption about what a cluster is, so comparing them shows which view fits movie reviews best.
+
+K means is the standard baseline for document clustering, which makes it a natural reference point. K medians follows the same idea but uses the median and the Manhattan distance, which makes it less affected by reviews with an unusual mix of words. Comparing the two shows whether such outliers pull the K means centres away from the bulk of the reviews. On the TF IDF side, both run on the matrix reduced with Latent Semantic Analysis (LSA). We normalise each reduced review to length one, so that distances compare the direction of reviews, which is the same as cosine similarity and suits text better than plain distances.
+
+The Gaussian mixture model allows clusters of different shapes and sizes, which is more realistic for text, where some themes are much more common than others. It has to estimate a variance per dimension and cluster, so it works best in few dimensions. LDA was designed specifically for text and groups reviews by shared topics instead of distance, so it tests whether a text specific model beats general clustering methods. It runs on the raw word counts, because it models how often words occur.
+
+We tuned the number of LSA dimensions with K means and 10 clusters. The silhouette rises as the number of dimensions falls, partly because distances are easier to separate in fewer dimensions, so it cannot be used alone to pick this value. Purity is also highest at 10 dimensions, so both measures agree and we use 10.
+
+```{r}
+#| label: lsa_tuning
+
+# purity: share of reviews matching the majority sentiment of their cluster
+purity <- function(cl) {
+  round(sum(apply(table(cl, movie_review$sentiment), 1, max)) / nrow(movie_review), 3)
+}
+
+# reduce TF IDF with LSA and normalise each review to length one
+reduce <- function(dims) {
+  set.seed(123)
+  x <- fit_transform(dtm_tfidf, LSA$new(n_topics = dims))
+  x / sqrt(rowSums(x^2))
+}
+
+# K means with 10 clusters for one number of dimensions
+tune_dims <- function(dims) {
+  x <- reduce(dims)
+  set.seed(123)
+  cl <- kmeans(x, centers = 10, nstart = 10, iter.max = 50)$cluster
+  tibble(
+    dims       = dims,
+    silhouette = round(mean(cluster::silhouette(cl, dist(x))[, 3]), 3),
+    purity     = purity(cl)
+  )
+}
+
+c(10, 20, 50, 100) |>
+  map(tune_dims) |>
+  bind_rows()
+```
+
+```{r}
+#| label: lsa_reduction
+
+# reduced matrix used by K means, K medians and GMM
+dtm_lsa <- reduce(10)
+```
+
+```{r}
+#| label: k_means
+#| warning: false
+
+run_kmeans <- function(x, k) {
+  set.seed(123)
+  kmeans(x, centers = k, nstart = 10, iter.max = 50)$cluster
+}
+
+kmeans_5  <- run_kmeans(dtm_lsa, 5)
+kmeans_10 <- run_kmeans(dtm_lsa, 10)
+```
+
+```{r}
+#| label: k_medians
+#| warning: false
+
+# kcca starts from random centres, so the seed is fixed inside the function
+run_kmedians <- function(x, k) {
+  set.seed(123)
+  fit <- kcca(x, k = k, family = kccaFamily("kmedians"))
+  clusters(fit)
+}
+
+kmedians_5  <- run_kmedians(dtm_lsa, 5)
+kmedians_10 <- run_kmedians(dtm_lsa, 10)
+```
+
+```{r}
+#| label: gaussian_mixture_model
+#| warning: false
+
+# GMM on the 10 LSA dimensions
+run_gmm <- function(k) {
+  set.seed(123)
+  fit <- Mclust(dtm_lsa, G = k, modelNames = "VVI", verbose = FALSE)
+  fit$classification
+}
+
+gmm_5  <- run_gmm(5)
+gmm_10 <- run_gmm(10)
+```
+
+```{r}
+#| label: lda
+
+# convert the counts to the format topicmodels expects
+counts     <- as(dtm, "TsparseMatrix")
+dtm_counts <- slam::simple_triplet_matrix(counts@i + 1, counts@j + 1, counts@x,
+                                      nrow(counts), ncol(counts), dimnames(counts))
+
+# LDA on the raw counts with a fixed seed, each review gets its most likely topic
+run_lda <- function(k) {
+  fit <- topicmodels::LDA(dtm_counts, k = k, method = "Gibbs",
+                        control = list(seed = 123, iter = 500))
+  topicmodels::topics(fit)
+}
+
+lda_5  <- run_lda(5)
+lda_10 <- run_lda(10)
+```
+
+```{r}
+#| label: word2vec_clustering
+
+# the same K means and K medians functions, now on the averaged word vectors
+w2v_kmeans_5    <- run_kmeans(doc_w2v, 5)
+w2v_kmeans_10   <- run_kmeans(doc_w2v, 10)
+w2v_kmedians_5  <- run_kmedians(doc_w2v, 5)
+w2v_kmedians_10 <- run_kmedians(doc_w2v, 10)
+```
+
+# Evaluation & model comparison
+
+We evaluate the models in two ways. First, we use the silhouette coefficient as an internal measure. It shows how close each review is to its own cluster compared to the nearest other cluster, with values close to 1 meaning well separated clusters. To compare the models fairly, we compute it for all of them in the same LSA space, using the same Euclidean distances. In the table, performance is the silhouette and other is purity.
+
+Second, we use the sentiment labels for external validation. Purity is the share of reviews that belong to the majority sentiment of their cluster. Since the two classes are balanced, a random clustering scores about 0.5. We use both measures because a model can form clearly separated clusters that have nothing to do with sentiment, for example clusters based on genre. Purity is also the only measure that is fully comparable across the two representations, since it does not depend on any distance.
+
+```{r}
+#| label: evaluation
+
+# distances between reviews in the LSA space, shared by all models
+d <- dist(dtm_lsa)
+
+# silhouette: how well separated the clusters are
+silhouette_score <- function(cl) round(mean(cluster::silhouette(cl, d)[, 3]), 3)
+
+clusterings <- list(kmeans_5, kmeans_10, kmedians_5, kmedians_10,
+                    gmm_5, gmm_10, lda_5, lda_10,
+                    w2v_kmeans_5, w2v_kmeans_10, w2v_kmedians_5, w2v_kmedians_10)
+
+data.frame(model = c("K means 5", "K means 10", "K medians 5", "K medians 10",
+                  "GMM 5", "GMM 10", "LDA 5", "LDA 10",
+                  "K means word2vec 5", "K means word2vec 10",
+                  "K medians word2vec 5", "K medians word2vec 10"),
+  performance = map_dbl(clusterings, silhouette_score),
+  other = map_dbl(clusterings, purity),
+  notes = c(rep("TF IDF, 10 LSA dimensions", 2),
+            rep("TF IDF, 10 LSA dimensions, Manhattan distance", 2),
+            rep("TF IDF, 10 LSA dimensions, diagonal covariances", 2),
+            rep("Raw counts, Gibbs sampling", 2),
+            rep("Averaged word vectors", 2),
+            rep("Averaged word vectors, Manhattan distance", 2))
+)
+```
+
+As is typical for text, all silhouettes are low, so we only use them to rank models. On TF IDF, K means with 5 clusters is the best model, with a silhouette of 0.134 and a purity of 0.737. Its lead in silhouette is partly built in, because the silhouette is computed in the LSA space that K means optimises, so its higher purity is the stronger evidence. K medians comes close and even matches K means on purity with 10 clusters, so the outliers we were worried about do not distort the K means clusters much. The GMM and LDA reach the lowest purity, around 0.66. With two classes, purity is never below 0.5, so all models capture sentiment to some degree, but none comes close to 1.
+
+Like LDA, the word2vec models are fitted in a different space, so we only compare them on purity. With 5 clusters they reach about 0.68, clearly below the 0.737 of K means on TF IDF, and with 10 clusters they reach about the same level as TF IDF. Averaging word vectors blurs mixed reviews towards the middle, whereas TF IDF keeps the full weight of strong words such as worst. Knowing that great and excellent are similar therefore does not help to separate sentiment here.
+
+```{r}
+#| label: stability
+
+# bootstrap stability of K means, as in the clustering lab
+# bootmean is the average Jaccard similarity of each cluster over 100 resamples
+stability <- function(k) {
+  boot <- fpc::clusterboot(dtm_lsa, B = 100, clustermethod = fpc::kmeansCBI,
+                           k = k, runs = 10, count = FALSE, seed = 123)
+  boot$bootmean
+}
+
+stab_5  <- stability(5)
+stab_10 <- stability(10)
+
+tibble(
+  model             = c("K means 5", "K means 10"),
+  mean_stability    = round(c(mean(stab_5), mean(stab_10)), 2),
+  unstable_clusters = c(sum(stab_5 < 0.6), sum(stab_10 < 0.6))
+)
+```
+
+K means always returns the requested number of clusters, even when the data has no clear groups. To check whether our clusters are real, we resample the reviews 100 times and measure how well each cluster comes back, using the Jaccard similarity. Clusters below 0.6 are usually considered unstable. With 5 clusters the mean stability is 0.87 and with 10 clusters 0.81, and no single cluster falls below 0.6. The 10 cluster solution is slightly less stable, because more borders have to run through regions where reviews are similar, but both solutions describe real structure in the reviews.
+
+```{r}
+#| label: cluster_content
+
+terms <- colnames(dtm_tfidf)
+
+# six words with the highest average TF IDF weight in a cluster
+top_terms <- function(c) {
+  weights <- Matrix::colMeans(dtm_tfidf[kmeans_10 == c, ])
+  str_c(terms[order(-weights)][1:6], collapse = ", ")
+}
+
+tibble(cluster = kmeans_10, sentiment = movie_review$sentiment) |>
+  group_by(cluster) |>
+  summarise(size = n(), positive = round(mean(sentiment), 2)) |>
+  mutate(top_words = map_chr(cluster, top_terms))
+```
+
+To see what the clusters mean, the table shows the most typical words and the share of positive reviews in each K means cluster with 10 clusters. Several clusters are genres or review types with mixed sentiment, such as horror, TV series, book adaptations and reviews about the story and characters. The negative reviews are found most clearly: two clusters built around bad and worst contain only 7 and 16 percent positive reviews. The positive side is less clear, with the comedy cluster and a cluster around great at 83 and 77 percent. This explains the moderate purity: the models mainly group reviews by what the film is about, and only partly by whether the reviewer liked it.
+
+Overall, we would choose K means with 5 clusters on the TF IDF representation. It scores best on both measures, its clusters are stable, and the extra clusters of the 10 cluster solution mostly split genres instead of adding sentiment information.
+
+# Team member contributions
+
+Thijs Letter: first version of the pre-processing, word2vec representation and K means clustering.
+
+Gerasimos Karatosidis: LDA topic modeling.
+
+Pieter Wassink: K medians clustering and the comparison with K means.
+
+Yann Klees: Gaussian mixture model and combining the code into one report.

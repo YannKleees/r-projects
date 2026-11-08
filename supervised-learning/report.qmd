@@ -1,0 +1,409 @@
+---
+title: "Supervised learning competition"
+author:
+  - Jerry Karatosidis
+  - Pieter Wassink
+  - Thijs Letter
+  - Yann Klees
+date: last-modified
+format:
+  html:
+    toc: true
+    self-contained: true
+    code-fold: true
+    df-print: kable
+---
+
+```{r}
+#| label: packages
+#| echo: false
+#| warning: false
+#| message: false
+
+library(tidyverse)
+library(ranger)
+library(randomForest)
+library(rpart)
+library(rpart.plot)
+set.seed(7)
+```
+
+```{r}
+#| label: data loading
+#| echo: false
+
+train <- readRDS("data/train.rds")
+test  <- readRDS("data/test.rds")
+```
+
+# Data description
+
+The training set has 316 students and the test set has 79. For each student we have 30 characteristics, and for the training students also their exam score, which is standardised. Of these characteristics, 17 are categorical, like sex, school and the parents' jobs. The other 13 are numeric, and most of those are ratings from 1 to 4 or 1 to 5. Most scores follow a normal distribution, but 10 students scored far below everyone else, with a clear gap between them and the rest. We think these students dropped out or did not take the exam.
+
+```{r}
+# Score distribution
+
+train %>%
+  ggplot(aes(x = score)) +
+  geom_histogram(bins = 30, fill = "navy", colour = "white") +
+  theme_minimal() +
+  labs(x = "Standardised exam score", y = "Number of students")
+```
+
+Most numeric predictors show weak or flat relationships with the score. Past failures show the clearest pattern, with more failures linked to lower scores. Absences are noisy and long tailed. Means at extreme values rest on very few students and should not be overinterpreted.
+
+```{r}
+# Numeric predictors vs score
+
+# keep only the numeric columns
+train_num <- train %>% select(where(is.numeric))
+
+# one row per student per variable
+train_num %>%
+  pivot_longer(-score) %>%
+  ggplot(aes(x = value, y = score)) +
+  # grey points: individual students
+  geom_jitter(width = 0.2, height = 0, alpha = 0.2, colour = "grey") +
+  # navy line and points: mean score per value
+  stat_summary(fun = mean, geom = "line", colour = "navy") +
+  stat_summary(fun = mean, geom = "point", colour = "navy", size = 2.5) +
+  facet_wrap(~ name, scales = "free_x") +
+  theme_minimal() +
+  labs(x = NULL, y = "Standardised exam score")
+```
+
+Most categorical features make little difference to the score. Students who do not plan on higher education and students who get extra school support score lower, though support likely goes to students who already struggle. Students whose mother works in health care or as a teacher score higher. The very low scores appear across levels, so no single categorical feature explains them.
+
+```{r}
+# Categorical predictors vs score
+
+factors <- names(train)[sapply(train, is.factor)]
+long    <- pivot_longer(train[c("score", factors)], -score)
+
+ggplot(long, aes(x = value, y = score)) +
+  geom_boxplot(fill = "navy", alpha = 0.3, outlier.alpha = 0.4) +
+  facet_wrap(~ name, scales = "free_x", ncol = 5) +
+  scale_x_discrete(guide = guide_axis(angle = 30)) +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank()) +
+  labs(x = NULL, y = "Standardised exam score")
+```
+
+```{r}
+# Correlations with score
+
+cor_df <- tibble(name = names(train_num), r = cor(train_num)[, "score"]) %>%
+  filter(name != "score")
+
+cor_df %>%
+  ggplot(aes(x = r, y = reorder(name, abs(r)))) +
+  geom_col(fill = "navy") +
+  theme_minimal() +
+  labs(x = "Correlation with score", y = NULL)
+```
+
+Past failures show the strongest relationship with the score, with a correlation of -0.41. Parental education, going out and age are weakly related, and the remaining features are close to zero. Since no single feature explains much, we expect models that combine many weak effects to do best.
+
+# Model description
+
+We compare six models. The simplest is a baseline that predicts the mean training score for every student, which gives a reference point for the other models. Linear regression models the score as a weighted sum of the features, with categorical features entered as dummy variables. Because it only captures additive, linear effects, it cannot model interactions, but it does fit the strongest pattern we found in the data and its coefficients are easy to interpret.
+
+A regression tree splits the students on one feature at a time and predicts the mean score in each final leaf, so it can model interactions and nonlinear effects and does not need scaled features. Single trees are unstable, since a small change in the training data can lead to a very different tree. A random forest reduces this problem by averaging hundreds of trees, where each tree is grown on a bootstrap sample and only considers a random subset of features at each split. We fit two forests. The first uses all 30 features and is tuned, while the second only uses the six most important features, to test whether leaving out weak predictors reduces noise.
+
+K nearest neighbours (KNN) predicts the score of a student as the mean score of the k most similar students in the training data, where similarity is measured by Euclidean distance. The method makes no assumptions about the shape of the relationship between features and score. Since all features count equally in the distance, the many features that are unrelated to the score also influence which students count as neighbours. The choice of k matters as well: with few neighbours the predictions are noisy, and with many neighbours they move toward the overall mean.
+
+# Data transformation and pre-processing
+
+```{r}
+# Missing values
+
+sum(is.na(train)) + sum(is.na(test))
+```
+
+The data contain no missing values. We kept the students with very low scores, because they are most likely real observations and the test set probably contains similar students. Removing them would lower the cross-validated error, but only because the hardest cases would no longer be part of the evaluation.
+
+Linear regression creates its own dummy variables, and trees and forests split on factors directly, so these models use the data as given. KNN works on distances between students, which means that all features have to be numeric and on a comparable scale. We code each binary factor as one 0/1 indicator and each nominal factor as one indicator per level, so that every difference in category counts equally. Since a few students have very many absences and would otherwise lie far from all other students, we log transform absences. We then standardise the numeric features and leave the 0/1 indicators unscaled, so that a mismatch on a binary feature weighs about as much as one standard deviation on a numeric feature. The means and standard deviations for the scaling are computed on the training folds only and then applied to the validation fold or the test set, so no information leaks from the data we predict.
+
+```{r}
+# KNN pre-processing
+
+# ---- variable groups ----
+binary_vars  <- c("school", "sex", "address", "famsize", "Pstatus", "schoolsup", "famsup",
+                  "paid", "activities", "nursery", "higher", "internet", "romantic")
+nominal_vars <- c("Mjob", "Fjob", "reason", "guardian")
+numeric_vars <- setdiff(names(test), c(binary_vars, nominal_vars))
+
+# dummy coding: one 0/1 column per binary factor, one column per level for nominal
+# factors; this only uses the fixed factor levels, so nothing is learned from the data
+encode_features <- function(data, log_absences = TRUE) {
+  x <- data |> select(all_of(numeric_vars))
+  if (log_absences) x <- mutate(x, absences = log1p(absences))
+  for (v in binary_vars) {
+    second_level <- levels(data[[v]])[2]
+    x[[paste0(v, "_", second_level)]] <- as.numeric(data[[v]] == second_level)
+  }
+  for (v in nominal_vars) {
+    for (lvl in levels(data[[v]])) x[[paste0(v, "_", lvl)]] <- as.numeric(data[[v]] == lvl)
+  }
+  x
+}
+
+# learn the scaling parameters from the (training) data passed in
+fit_preprocessing <- function(data, log_absences = TRUE, scale_cols = "numeric") {
+  x <- encode_features(data, log_absences)
+  cols <- switch(scale_cols,
+                 numeric = numeric_vars,
+                 all     = names(x),
+                 none    = character(0))
+  list(log_absences = log_absences,
+       cols  = cols,
+       means = map_dbl(x[cols], mean),
+       sds   = map_dbl(x[cols], sd))
+}
+
+# apply stored parameters to data sets (training folds, validation folds or test set)
+apply_preprocessing <- function(data, prep) {
+  x <- encode_features(data, prep$log_absences)
+  for (col in prep$cols) x[[col]] <- (x[[col]] - prep$means[[col]]) / prep$sds[[col]]
+  as.matrix(x)
+}
+
+# ---- KNN regression ----
+
+# training scores of all training students, sorted from nearest to farthest,
+# for every row of x_new (squared Euclidean distance gives the same ranking)
+knn_sorted_scores <- function(x_train, y_train, x_new) {
+  dist2 <- outer(rowSums(x_new^2), rowSums(x_train^2), "+") - 2 * x_new %*% t(x_train)
+  t(apply(dist2, 1, \(d) y_train[order(d)]))
+}
+
+# prediction = mean score of the k nearest training students
+knn_predict <- function(x_train, y_train, x_new, k) {
+  rowMeans(knn_sorted_scores(x_train, y_train, x_new)[, 1:k, drop = FALSE])
+}
+```
+
+# Model comparison
+
+We compare all models with 10 fold cross validation, using mean squared error, the competition metric, which penalises the very low scores heavily. We reset the seed before each run, so every model is evaluated on the same folds and differences come from the models rather than from the split. A single 80/20 split would leave only about 63 validation students and give a noisy estimate.
+
+Every step that learns from the data should happen inside the training folds. For KNN, the scaling is fitted on the training folds only. The six features of the lean forest, however, were chosen from the variable importance of a forest fitted on all training data, so the validation students influenced that choice. To measure this effect, we also evaluate a version that repeats the importance ranking inside every training fold. We tune the full forest's number of features per split and minimum node size over a grid of 16 combinations using out of bag error, choose `k` for KNN from 1 to 50 with the same cross validation, and use the tree's default complexity parameter. These tuning choices also use the full training data, so small differences between models should not be overinterpreted.
+
+```{r}
+# Cross validation function
+
+mse <- function(y_true, y_pred) mean((y_true - y_pred)^2)
+
+cv_model <- function(formula, dataset, k, fit_predict) {
+  stopifnot(inherits(formula, "formula"))  # formula must be a formula
+  stopifnot(is.data.frame(dataset))        # dataset must be data frame
+  stopifnot(is.function(fit_predict))      # model must be a function
+
+  # add a fold column to the dataset
+  n_samples  <- nrow(dataset)
+  select_vec <- rep(1:k, length.out = n_samples)
+  data_split <- dataset %>% mutate(folds = sample(select_vec))
+
+  # extract the y column name from the formula
+  y_column_name <- as.character(formula)[2]
+
+  mses <- rep(0, k)
+
+  for (i in 1:k) {
+    # split the data in train and validation set, drop the fold column
+    data_train <- data_split %>% filter(folds != i) %>% select(-folds)
+    data_valid <- data_split %>% filter(folds == i) %>% select(-folds)
+
+    # fit on the train folds, predict the validation fold
+    y_pred <- fit_predict(formula, data_train, data_valid)
+
+    mses[i] <- mse(y_true = data_valid[[y_column_name]], y_pred = y_pred)
+  }
+
+  mean(mses)
+}
+```
+
+```{r}
+# Random forest tuning
+
+# tune mtry and min.node.size on out of bag error
+grid <- expand.grid(mtry = c(15, 20, 25, 30), min.node.size = c(10, 20, 30, 50))
+
+grid$error <- sapply(seq_len(nrow(grid)), function(i) {
+  set.seed(7)
+  ranger(score ~ ., data = train, num.trees = 500, mtry = grid$mtry[i],
+         min.node.size = grid$min.node.size[i])$prediction.error
+})
+
+best <- grid[which.min(grid$error), ]
+best
+```
+
+```{r}
+#| fig.width: 8
+#| fig.height: 5
+# Variable importance used to select the six features
+
+# Train an exploratory model to track variable importance
+set.seed(7)
+rf_investigator <- randomForest(
+  score ~ .,
+  data = train,
+  ntree = 500,
+  importance = TRUE
+)
+
+# Plot the results for the report
+varImpPlot(rf_investigator, main = "Variable Importance for Predicting Score")
+```
+
+```{r}
+# Regression tree fitted on all training data
+
+tree_mod <- rpart(
+  formula = score ~ .,
+  data = train,
+  method = "anova")
+
+tree_plot <- rpart.plot(tree_mod)
+```
+
+```{r}
+# Models
+
+# average training score
+fit_mean <- function(formula, data_train, data_valid) {
+  rep(mean(data_train$score), nrow(data_valid))
+}
+# fit_lm fits a linear regression
+fit_lm <- function(formula, data_train, data_valid) {
+  model <- lm(formula, data = data_train)
+  predict(model, newdata = data_valid)
+}
+# fit_tree fits a regression tree ("anova" because score is continuous)
+fit_tree <- function(formula, data_train, data_valid) {
+  model <- rpart(
+    formula = formula,
+    data = data_train,
+    method = "anova")
+  predict(model, newdata = data_valid)
+}
+# fit_rf fits the tuned random forest of 500 trees
+fit_rf <- function(formula, data_train, data_valid) {
+  model <- ranger(formula, data = data_train, num.trees = 500,
+                  mtry = best$mtry, min.node.size = best$min.node.size)
+  predict(model, data = data_valid)$predictions
+}
+# fit_rf_six fits a random forest on the six most important features
+fit_rf_six <- function(formula, data_train, data_valid) {
+  # Train the lean model using only the most important features
+  rf_model <- randomForest(
+    score ~ failures + absences + schoolsup + sex + goout + Medu,
+    data = data_train,
+    ntree = 500,
+    nodesize = 15
+  )
+  predict(rf_model, newdata = data_valid)
+}
+# fit_rf_six_check repeats the feature selection inside every training fold,
+# so the validation fold cannot influence which six features are chosen
+fit_rf_six_check <- function(formula, data_train, data_valid) {
+  rf_investigator <- randomForest(score ~ ., data = data_train, ntree = 500, importance = TRUE)
+  top6 <- names(sort(importance(rf_investigator)[, "%IncMSE"], decreasing = TRUE))[1:6]
+  rf_model <- randomForest(score ~ ., data = data_train[c("score", top6)],
+                           ntree = 500, nodesize = 15)
+  predict(rf_model, newdata = data_valid)
+}
+# fit_knn(k) returns a KNN model with k neighbours; the pre-processing is
+# fitted on the training folds only and then applied to the validation fold
+fit_knn <- function(k) {
+  function(formula, data_train, data_valid) {
+    prep <- fit_preprocessing(data_train)
+    knn_predict(apply_preprocessing(data_train, prep), data_train$score,
+                apply_preprocessing(data_valid, prep), k = k)
+  }
+}
+```
+
+```{r}
+# Choosing k for KNN
+
+knn_cv <- tibble(k = 1:50)
+
+knn_cv$cv_mse <- sapply(knn_cv$k, function(k) {
+  set.seed(7)
+  cv_model(score ~ ., train, 10, fit_knn(k))
+})
+
+best_k <- knn_cv$k[which.min(knn_cv$cv_mse)]
+
+# the red point marks the lowest MSE
+ggplot(knn_cv, aes(x = k, y = cv_mse)) +
+  geom_line(colour = "grey40") +
+  geom_point(size = 1, colour = "grey40") +
+  geom_point(data = filter(knn_cv, k == best_k), colour = "firebrick", size = 2.5) +
+  labs(x = "Number of neighbours k", y = "Cross-validated MSE") +
+  theme_minimal()
+```
+
+```{r}
+# Results
+
+set.seed(7)
+mse_mean <- cv_model(score ~ ., train, 10, fit_mean)
+
+set.seed(7)
+mse_lm <- cv_model(score ~ ., train, 10, fit_lm)
+
+set.seed(7)
+mse_tree <- cv_model(score ~ ., train, 10, fit_tree)
+
+set.seed(7)
+mse_rf <- cv_model(score ~ ., train, 10, fit_rf)
+
+set.seed(7)
+mse_rf_six <- cv_model(score ~ ., train, 10, fit_rf_six)
+
+set.seed(7)
+mse_rf_six_check <- cv_model(score ~ ., train, 10, fit_rf_six_check)
+
+set.seed(7)
+mse_knn <- cv_model(score ~ ., train, 10, fit_knn(best_k))
+
+results <- tibble(
+  model  = c("Mean baseline", "Linear regression", "Regression tree",
+             "Random forest (tuned)", "Random forest (six features)",
+             "Random forest (six features, selected within folds)",
+             paste0("KNN (k = ", best_k, ")")),
+  cv_mse = c(mse_mean, mse_lm, mse_tree, mse_rf, mse_rf_six, mse_rf_six_check, mse_knn)
+) %>%
+  arrange(cv_mse)
+
+results %>% mutate(cv_mse = round(cv_mse, 3))
+```
+
+# Chosen model
+
+The lean six-feature forest has the lowest cross-validated error, 0.696, but this result is not reliable. When its features are selected inside each training fold, its error rises to 0.754, so most of its advantage came from choosing features with knowledge of the validation students. We therefore choose the tuned random forest, with an MSE of 0.728, compared with 0.843 for KNN, 0.854 for linear regression, 0.886 for the regression tree and 0.973 for the mean baseline. This is an improvement of about 25 percent over the baseline and 15 percent over linear regression. The forest likely performs best because most features are only weakly related to the score, and averaging many trees allows it to combine these small effects, including nonlinear effects and interactions, without the instability of a single tree. Its out of bag error of 0.731 is close to the cross-validated error. We refit it on the full training data with 25 features per split and a minimum node size of 30, and use it to predict the test set.
+
+```{r}
+#| label: final predictions
+
+# refit the chosen model on all training data
+set.seed(7)
+model_final <- ranger(score ~ ., data = train, num.trees = 500,
+                      mtry = best$mtry, min.node.size = best$min.node.size)
+
+pred <- predict(model_final, data = test)$predictions
+stopifnot(length(pred) == 79)
+
+write_rds(pred, "predictions.rds")
+```
+
+# Team member contributions
+
+- Jerry Karatosidis: lean random forest, variable importance analysis.
+- Pieter Wassink: KNN, its pre-processing and choice of k.
+- Thijs Letter: categorical exploration, linear regression and regression tree.
+- Yann Klees: numeric exploration, mean baseline, cross validation, random forest tuning, combining the report.
